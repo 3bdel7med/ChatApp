@@ -1,4 +1,5 @@
 name: Chat app deployment
+
 on:
   push:
     branches:
@@ -6,66 +7,73 @@ on:
   pull_request:
     branches:
       - main
-job:
+
+jobs:
   build-and-test:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
-        #php environment
+
+      # php environment
       - name: Set up PHP
         uses: shivammathur/setup-php@v2
         with:
           php-version: '8.1'
-          extensions: mbstring, bcmath, curl, xml, zip,pdo, mysql
-      - name: Install dependencies
-        run: composer install
-      - name: Run tests
+          extensions: mbstring, bcmath, curl, xml, zip, pdo, mysql
+
+      - name: Install Composer Dependencies
+        run: composer install --prefer-dist --no-progress
+
+      - name: Run PHP Unit Tests
         run: vendor/bin/phpunit --configuration phpunit.xml
-        #node environment
+
+      # node environment
       - name: Set up Node.js
-        uses: actions/setup-node@v3
+        uses: actions/setup-node@v4
         with:
           node-version: '20'
-      - name: Install Node.js dependencies
-        run: npm install
-        # composer dependencies
-      - name: Install Composer dependencies
-        run: composer install --no-dev --optimize-autoloader
-      - name: Build assets
-        run: npm run build
-        # vite and tailwindcss
+
+      - name: Install Node.js Dependencies
+        run: npm ci || npm install
+
       - name: Build Vite assets
         run: npm run build
-      - name: run tests
-        run: npm test
+
+      - name: Run JS Tests
+        run: npm test --if-present
+
   deploy:
     runs-on: ubuntu-latest
     needs: build-and-test
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
+
       - name: Set up PHP
         uses: shivammathur/setup-php@v2
         with:
           php-version: '8.1'
-          extensions: mbstring, bcmath, curl, xml, zip,pdo, mysql
-      - name: Install dependencies
+          extensions: mbstring, bcmath, curl, xml, zip, pdo, mysql
+
+      - name: Install PHP Dependencies for Production
         run: composer install --no-dev --optimize-autoloader
+
       - name: Set up Node.js
-        uses: actions/setup-node@v3
+        uses: actions/setup-node@v4
         with:
           node-version: '20'
-      - name: Install Node.js dependencies
-        run: npm install
-      - name: Build assets
-        run: npm run build
-      - name: Deploy to server
+
+      - name: Install Node.js Dependencies & Build
+        run: |
+          npm ci || npm install
+          npm run build
+
+      - name: Deploy to Server via SSH
         uses: easingthemes/ssh-deploy@v2.0.7
-        with:
-          ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
-          remote-user: ${{ secrets.REMOTE_USER }}
-          server-ip: ${{ secrets.SERVER_IP }}
-          remote-path: ${{ secrets.REMOTE_PATH }}      
-
-
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          REMOTE_USER: ${{ secrets.REMOTE_USER }}
+          SERVER_IP: ${{ secrets.SERVER_IP }}
+          REMOTE_PATH: ${{ secrets.REMOTE_PATH }}
