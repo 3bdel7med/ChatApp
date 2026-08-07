@@ -19,7 +19,7 @@ jobs:
       - name: Set up PHP
         uses: shivammathur/setup-php@v2
         with:
-          php-version: '8.1'
+          php-version: '8.2'
           extensions: mbstring, bcmath, curl, xml, zip, pdo, mysql
 
       - name: Install Composer Dependencies
@@ -54,7 +54,7 @@ jobs:
       - name: Set up PHP
         uses: shivammathur/setup-php@v2
         with:
-          php-version: '8.1'
+          php-version: '8.2'
           extensions: mbstring, bcmath, curl, xml, zip, pdo, mysql
 
       - name: Install PHP Dependencies for Production
