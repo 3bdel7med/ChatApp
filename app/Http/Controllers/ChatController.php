@@ -25,24 +25,45 @@ class ChatController extends Controller
         $validated = $request->validate([
             'receiver_id' => ['required', 'exists:users,id', 'different:'.auth()->id()],
         ]);
+
         $authId = auth()->id();
         $receiverId = $validated['receiver_id'];
-        $conversation = \App\Models\Conversation::where(function ($query) use ($authId, $receiverId) {
+
+        $conversation = Conversation::where(function ($query) use ($authId, $receiverId) {
             $query->where('sender_id', $authId)
                 ->where('receiver_id', $receiverId);
         })->orWhere(function ($query) use ($authId, $receiverId) {
             $query->where('sender_id', $receiverId)
                 ->where('receiver_id', $authId);
         })->first();
+
         if (!$conversation) {
-            $conversation = \App\Models\Conversation::create([
+            $conversation = Conversation::create([
                 'sender_id' => $authId,
                 'receiver_id' => $receiverId,
                 'type' => 'direct',
             ]);
         }
-        return redirect()->route('chat.show', $conversation->id);
 
+        // Return JSON for Axios/AJAX background creation without redirecting
+        if ($request->wantsJson()) {
+            return response()->json(
+                $this->formatConversation($conversation->load(['sender', 'receiver', 'messages'])),
+                201
+            );
+        }
+
+        return redirect()->route('chat.show', $conversation->id);
+    }
+
+    // Alias method in case route('chat.start') maps here
+    public function startChat(Request $request, $userId = null)
+    {
+        if ($userId) {
+            $request->merge(['receiver_id' => $userId]);
+        }
+
+        return $this->getOrCreateConversation($request);
     }
 
     public function createGroup(Request $request)
@@ -68,12 +89,20 @@ class ChatController extends Controller
         // Attach all participants
         $conversation->participants()->attach($allUserIds);
 
+        // Return JSON for Axios/AJAX background creation without redirecting
+        if ($request->wantsJson()) {
+            return response()->json(
+                $this->formatConversation($conversation->load(['participants', 'messages'])),
+                201
+            );
+        }
+
         return redirect()->route('chat.show', $conversation->id);
     }
 
     public function showConversation($conversationId)
     {
-        $conversation = \App\Models\Conversation::findOrFail($conversationId);
+        $conversation = Conversation::findOrFail($conversationId);
 
         // Authorize: check if user is sender, receiver, or a participant
         $isAuthorized = $conversation->sender_id === auth()->id()
@@ -87,7 +116,7 @@ class ChatController extends Controller
             ->oldest()
             ->get();
 
-return Inertia::render('Chat/Show', [
+        return Inertia::render('Chat/Show1', [
             'conversation' => $conversation->load(['sender', 'receiver', 'participants']),
             'messages'     => $messages,
             'conversations' => $this->getAuthUserConversations(),
@@ -159,7 +188,6 @@ return Inertia::render('Chat/Show', [
 
     public function storeMessage(Request $request, Conversation $conversation)
     {
-        // 1. Fixed validation: Body is required ONLY if no file is present
         $validated = $request->validate([
             'body' => 'required_without:file|nullable|string|max:5000',
             'file' => 'required_without:body|nullable|file|max:10240',
@@ -175,24 +203,17 @@ return Inertia::render('Chat/Show', [
             $fileName = $file->getClientOriginalName();
             $mimeType = $file->getMimeType();
 
-            // Determine if image or general file
             $fileType = str_starts_with($mimeType, 'image/') ? 'image' : 'file';
-
-            // Store file safely
             $path = $file->store('chat_files', 'public');
-
-            // Import or use global helper to avoid class errors
             $filePath = Storage::url($path);
         }
 
-        // For groups, receiver_id is null since there are multiple recipients
         if ($conversation->type === 'group') {
             $receiverId = null;
         } else {
             $receiverId = $conversation->getOtherUser(auth()->id())->id;
         }
 
-        // 2. Used safe null-coalescing for the body field
         $message = $conversation->messages()->create([
             'sender_id'   => auth()->id(),
             'receiver_id' => $receiverId,
@@ -205,20 +226,17 @@ return Inertia::render('Chat/Show', [
         $conversation->update([
             'last_message_at' => now(),
         ]);
-        // Resolve notification recipients based on conversation type
+
         if ($conversation->type === 'group') {
-            // Group: all participants except the sender
             $recipients = $conversation->participants()
                 ->where('users.id', '!=', auth()->id())
                 ->get();
         } else {
-            // Direct: the other participant
             $recipients = collect([$conversation->getOtherUser(auth()->id())])->filter();
         }
 
         broadcast(new MessageSent($message))->toOthers();
         Notification::send($recipients, new NewChatMessage($message));
-
 
         return back()->with('message', $message);
     }

@@ -1,309 +1,326 @@
-import { ref, onUnmounted } from 'vue'
+import { ref, unref, onUnmounted } from 'vue'
 import axios from 'axios'
 
-const ICE_SERVERS = {
-  iceServers: [
-    { urls: 'stun:stun.l.google.com:19302' },
-    { urls: 'stun:stun1.l.google.com:19302' },
-  ],
-}
+export function useWebRTC(conversationIdRef?: any) {
+  const peerConnection = ref<RTCPeerConnection | null>(null)
+  const localStream = ref<MediaStream | null>(null)
+  const remoteStream = ref<MediaStream | null>(null)
 
-/**
- * Generate a ringing tone using Web Audio API (no external files needed)
- */
-function createRingingTone(): { play: () => void; stop: () => void } {
-  let audioCtx: AudioContext | null = null
-  let gainNode: GainNode | null = null
-  let oscillator1: OscillatorNode | null = null
-  let oscillator2: OscillatorNode | null = null
-  let isPlaying = false
-  let timeoutId: number | null = null
-
-  const play = () => {
-    if (isPlaying) return
-    isPlaying = true
-
-    try {
-      audioCtx = new AudioContext()
-      gainNode = audioCtx.createGain()
-      gainNode.gain.value = 0.3
-      gainNode.connect(audioCtx.destination)
-
-      // Create a dual-tone ring (like a phone ring: 440Hz + 480Hz)
-      oscillator1 = audioCtx.createOscillator()
-      oscillator1.type = 'sine'
-      oscillator1.frequency.value = 440
-      oscillator1.connect(gainNode)
-
-      oscillator2 = audioCtx.createOscillator()
-      oscillator2.type = 'sine'
-      oscillator2.frequency.value = 480
-      oscillator2.connect(gainNode)
-
-      oscillator1.start()
-      oscillator2.start()
-
-      // Ring pattern: 2 seconds on, 4 seconds off (repeat)
-      const ringPattern = () => {
-        if (!gainNode || !isPlaying) return
-        gainNode.gain.value = 0.3
-        timeoutId = window.setTimeout(() => {
-          if (gainNode && isPlaying) {
-            gainNode.gain.value = 0
-            timeoutId = window.setTimeout(ringPattern, 4000)
-          }
-        }, 2000)
-      }
-      ringPattern()
-    } catch (e) {
-      console.warn('Could not create ringing tone:', e)
-    }
-  }
-
-  const stop = () => {
-    isPlaying = false
-    if (timeoutId !== null) {
-      clearTimeout(timeoutId)
-      timeoutId = null
-    }
-    try {
-      oscillator1?.stop()
-      oscillator2?.stop()
-    } catch (e) { /* ignore */ }
-    oscillator1 = null
-    oscillator2 = null
-    gainNode = null
-    if (audioCtx) {
-      audioCtx.close().catch(() => {})
-      audioCtx = null
-    }
-  }
-
-  return { play, stop }
-}
-
-export function useWebRTC(conversationId: number) {
   const isCallActive = ref(false)
   const isCallIncoming = ref(false)
   const isCallOutgoing = ref(false)
-  const callDuration = ref(0)
-  const remoteStream = ref<MediaStream | null>(null)
-  const localStream = ref<MediaStream | null>(null)
-  const callerName = ref('')
-  const isMicMuted = ref(false)
-  const isSpeakerMuted = ref(false)
   const isVideoCall = ref(false)
-  const isCameraEnabled = ref(false)
 
-  let peerConnection: RTCPeerConnection | null = null
-  let localMediaStream: MediaStream | null = null
-  let callTimerInterval: number | null = null
+  const callerName = ref('')
+  const targetConversationId = ref<number | null>(null)
 
-  // Ringing tone controllers
-  let incomingRingTone = createRingingTone()
-  let outgoingRingbackTone = createRingingTone()
+  const isMicMuted = ref(false)
+  const isCameraEnabled = ref(true)
+  const isSpeakerMuted = ref(false)
 
-  // Store pending offer data until user accepts
-  let pendingOffer: any = null
-  let pendingCaller: any = null
-  let pendingVideo = false
+  const callDuration = ref(0)
+  let timerInterval: any = null
 
-  // Initialize Echo listener for call events on an existing channel
-  const registerCallListeners = (channel: any) => {
-    channel.listen('.call.event', async (e: any) => {
-      const { type, data, caller } = e
+  const pendingOffer = ref<any>(null)
+  const pendingCandidates: RTCIceCandidateInit[] = []
 
-      switch (type) {
-        case 'offer':
-          // Store offer + caller info, show incoming UI
-          pendingOffer = data
-          pendingCaller = caller
-          callerName.value = caller.name
-          // Detect whether this is a video call from the offer payload
-          pendingVideo = !!(data && data.video)
-          isVideoCall.value = pendingVideo
-          isCallIncoming.value = true
-          // Play incoming ringing tone
-          incomingRingTone.play()
-          break
-
-        case 'answer':
-          // Caller receives answer — stop ringback tone
-          outgoingRingbackTone.stop()
-          await handleAnswer(data)
-          // Start the call timer only when the receiver accepts the call
-          if (callTimerInterval === null) {
-            startCallTimer()
-          }
-          break
-
-        case 'ice-candidate':
-          if (data && peerConnection) {
-            try {
-              await peerConnection.addIceCandidate(new RTCIceCandidate(data))
-            } catch (err) {
-              console.error('Error adding ICE candidate:', err)
-            }
-          }
-          break
-
-        case 'end-call':
-          stopAllTones()
-          cleanupCall()
-          break
-      }
-    })
+  const rtcConfig: RTCConfiguration = {
+    iceServers: [
+      { urls: 'stun:stun.l.google.com:19302' },
+      { urls: 'stun:stun1.l.google.com:19302' }
+    ]
   }
 
-  // Start a call (caller)
-  const startCall = async (video = false) => {
+  // مستخرج آمن لرقم المحادثة
+  const getActiveConversationId = (overrideId?: number): number | null => {
+    if (overrideId) return Number(overrideId)
+    if (targetConversationId.value) return Number(targetConversationId.value)
+
+    const extracted = unref(conversationIdRef)
+    if (extracted && typeof extracted === 'object' && 'value' in extracted) {
+      return Number(extracted.value) || null
+    }
+    return extracted ? Number(extracted) : null
+  }
+
+  const startTimer = () => {
+    stopTimer()
+    callDuration.value = 0
+    timerInterval = setInterval(() => {
+      callDuration.value++
+    }, 1000)
+  }
+
+  const stopTimer = () => {
+    if (timerInterval) {
+      clearInterval(timerInterval)
+      timerInterval = null
+    }
+  }
+
+  const formatDuration = (seconds: number) => {
+    const mins = Math.floor(seconds / 60)
+    const secs = seconds % 60
+    return `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`
+  }
+
+  // إرسال إشارات WebRTC مع دعم Fallback Route
+  const sendSignal = async (type: string, data: any = null, convId?: number) => {
+    const activeId = getActiveConversationId(convId)
+    if (!activeId) {
+      console.warn('Cannot send signal: No active conversation ID provided.')
+      return
+    }
+
+    const payload = { type, data, conversation_id: activeId }
+
     try {
-      localMediaStream = await navigator.mediaDevices.getUserMedia({ audio: true, video })
-      localStream.value = localMediaStream
-      isVideoCall.value = video
-      isCameraEnabled.value = video
-      isCallOutgoing.value = true
-      isCallActive.value = true
-      // Play ringback tone for the caller (timer starts when receiver accepts)
-      outgoingRingbackTone.play()
+      await axios.post(`/conversations/${activeId}/signal`, payload)
+    } catch (err: any) {
+      if (err?.response?.status === 404) {
+        try {
+          await axios.post(`/chat/${activeId}/call/signal`, payload)
+        } catch (fallbackErr) {
+          console.error('Signal Fallback Failed:', fallbackErr)
+        }
+      } else {
+        console.error('Error sending signal:', err)
+      }
+    }
+  }
 
-      peerConnection = new RTCPeerConnection(ICE_SERVERS)
-      localMediaStream.getTracks().forEach(track => {
-        peerConnection!.addTrack(track, localMediaStream!)
+  const initPeerConnection = () => {
+    if (peerConnection.value) return peerConnection.value
+
+    const pc = new RTCPeerConnection(rtcConfig)
+    remoteStream.value = new MediaStream()
+
+    pc.ontrack = (event) => {
+      if (event.streams && event.streams[0]) {
+        event.streams[0].getTracks().forEach((track) => {
+          remoteStream.value?.addTrack(track)
+        })
+      }
+    }
+
+    pc.onicecandidate = (event) => {
+      if (event.candidate) {
+        const currentConvId = getActiveConversationId()
+        if (currentConvId) {
+          sendSignal('candidate', event.candidate, currentConvId)
+        }
+      }
+    }
+
+    pc.onconnectionstatechange = () => {
+      if (pc.connectionState === 'connected') {
+        isCallOutgoing.value = false
+        isCallIncoming.value = false
+        isCallActive.value = true
+        startTimer()
+      } else if (['disconnected', 'failed', 'closed'].includes(pc.connectionState)) {
+        cleanupCall()
+      }
+    }
+
+    peerConnection.value = pc
+    return pc
+  }
+
+  const setupLocalStream = async (video: boolean) => {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: true,
+        video: video ? { width: { ideal: 1280 }, height: { ideal: 720 } } : false
       })
+      localStream.value = stream
+      const pc = initPeerConnection()
 
-      peerConnection.onicecandidate = (event) => {
-        if (event.candidate) {
-          sendSignal('ice-candidate', event.candidate)
-        }
-      }
-
-      peerConnection.ontrack = (event) => {
-        remoteStream.value = event.streams[0]
-      }
-
-      peerConnection.oniceconnectionstatechange = () => {
-        if (peerConnection?.iceConnectionState === 'connected' ||
-            peerConnection?.iceConnectionState === 'completed') {
-          // Connection established — stop ringback if still playing
-          outgoingRingbackTone.stop()
-        }
-        if (peerConnection?.iceConnectionState === 'disconnected' ||
-            peerConnection?.iceConnectionState === 'failed') {
-          cleanupCall()
-        }
-      }
-
-      const offer = await peerConnection.createOffer({
-        offerToReceiveAudio: true,
-        offerToReceiveVideo: video,
+      stream.getTracks().forEach((track) => {
+        pc.addTrack(track, stream)
       })
-      await peerConnection.setLocalDescription(offer)
-      // Include the video flag in the offer payload so the callee knows it's a video call
-      sendSignal('offer', { sdp: offer.sdp, type: offer.type, video })
     } catch (err) {
-      console.error('Error starting call:', err)
+      console.error('Failed to access media devices:', err)
       cleanupCall()
     }
   }
 
-  // Accept incoming call (receiver clicks "Accept")
-  const acceptCall = async () => {
-    try {
-      // Stop incoming ringing tone
-      incomingRingTone.stop()
+  const startCall = async (video: boolean = false, convId?: number) => {
+    const activeId = getActiveConversationId(convId)
+    if (!activeId) return
 
-      isCallIncoming.value = false
-      isCallOutgoing.value = false
-      isVideoCall.value = pendingVideo
+    targetConversationId.value = activeId
+    isVideoCall.value = video
+    isCallOutgoing.value = true
 
-      // Get local media (video only if the incoming call is a video call)
-      localMediaStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: pendingVideo })
-      localStream.value = localMediaStream
-      isCameraEnabled.value = pendingVideo
-      isCallActive.value = true
-      if (callTimerInterval === null) {
-        startCallTimer()
-      }
+    await setupLocalStream(video)
+    const pc = peerConnection.value
+    if (!pc) return
 
-      peerConnection = new RTCPeerConnection(ICE_SERVERS)
-      localMediaStream.getTracks().forEach(track => {
-        peerConnection!.addTrack(track, localMediaStream!)
-      })
+    const offer = await pc.createOffer()
+    await pc.setLocalDescription(offer)
 
-      peerConnection.onicecandidate = (event) => {
-        if (event.candidate) {
-          sendSignal('ice-candidate', event.candidate)
+    await sendSignal('offer', {
+      type: offer.type,
+      sdp: offer.sdp,
+      isVideo: video
+    }, activeId)
+  }
+
+  const acceptCall = async (customOffer?: any) => {
+    const offerToUse = customOffer || pendingOffer.value
+    if (!offerToUse) {
+      console.warn('No pending offer found to accept call.')
+      return
+    }
+
+    const activeId = getActiveConversationId()
+    isCallIncoming.value = false
+
+    // فحص ما إذا كانت المكالمة تحتوي على فيديو
+    let sdpData = offerToUse
+    if (typeof sdpData === 'string') {
+      try { sdpData = JSON.parse(sdpData) } catch (e) { sdpData = { type: 'offer', sdp: sdpData } }
+    }
+
+    if (sdpData.isVideo !== undefined) {
+      isVideoCall.value = !!sdpData.isVideo
+    }
+
+    await setupLocalStream(isVideoCall.value)
+
+    const pc = peerConnection.value
+    if (!pc) return
+
+    const sessionInit: RTCSessionDescriptionInit = {
+      type: sdpData.type || 'offer',
+      sdp: typeof sdpData.sdp === 'string' ? sdpData.sdp : sdpData.sdp || sdpData
+    }
+
+    await pc.setRemoteDescription(new RTCSessionDescription(sessionInit))
+
+    const answer = await pc.createAnswer()
+    await pc.setLocalDescription(answer)
+
+    await sendSignal('answer', {
+      type: answer.type,
+      sdp: answer.sdp
+    }, activeId!)
+
+    await processPendingCandidates()
+    pendingOffer.value = null
+  }
+
+  const handleSignal = async (event: any) => {
+    const { type, data, caller, conversation_id } = event
+
+    if (conversation_id) {
+      targetConversationId.value = Number(conversation_id)
+    }
+
+    switch (type) {
+      case 'offer':
+        callerName.value = caller?.name || 'مكالمة واردة'
+        isVideoCall.value = !!data?.isVideo
+        pendingOffer.value = data
+        isCallIncoming.value = true
+        break
+
+      case 'answer':
+        if (peerConnection.value && isCallOutgoing.value) {
+          let sdpData = data
+          if (typeof sdpData === 'string') {
+            try { sdpData = JSON.parse(sdpData) } catch (e) { sdpData = { type: 'answer', sdp: sdpData } }
+          }
+          const sessionInit: RTCSessionDescriptionInit = {
+            type: sdpData.type || 'answer',
+            sdp: typeof sdpData.sdp === 'string' ? sdpData.sdp : sdpData.sdp || sdpData
+          }
+          await peerConnection.value.setRemoteDescription(new RTCSessionDescription(sessionInit))
+          await processPendingCandidates()
         }
-      }
+        break
 
-      peerConnection.ontrack = (event) => {
-        remoteStream.value = event.streams[0]
-      }
-
-      peerConnection.oniceconnectionstatechange = () => {
-        if (peerConnection?.iceConnectionState === 'disconnected' ||
-            peerConnection?.iceConnectionState === 'failed') {
-          cleanupCall()
+      case 'candidate':
+        if (peerConnection.value && peerConnection.value.remoteDescription) {
+          try {
+            await peerConnection.value.addIceCandidate(new RTCIceCandidate(data))
+          } catch (e) {
+            console.error('Error adding ICE candidate:', e)
+          }
+        } else {
+          pendingCandidates.push(data)
         }
-      }
+        break
 
-      // If we have a pending offer, set remote description and send answer
-      if (pendingOffer) {
-        // Rebuild a proper RTCSessionDescription from the payload
-        const remoteDescription = new RTCSessionDescription({
-          type: pendingOffer.type || 'offer',
-          sdp: pendingOffer.sdp,
-        })
-        await peerConnection.setRemoteDescription(remoteDescription)
-        const answer = await peerConnection.createAnswer({
-          offerToReceiveAudio: true,
-          offerToReceiveVideo: pendingVideo,
-        })
-        await peerConnection.setLocalDescription(answer)
-        sendSignal('answer', { sdp: answer.sdp, type: answer.type, video: pendingVideo })
-        pendingOffer = null
-        pendingCaller = null
-      }
-    } catch (err) {
-      console.error('Error accepting call:', err)
-      cleanupCall()
+      case 'reject':
+      case 'end':
+        cleanupCall()
+        break
     }
   }
 
-  // Handle answer (caller receives answer)
-  const handleAnswer = async (answer: any) => {
-    try {
-      if (peerConnection && peerConnection.signalingState !== 'closed') {
-        await peerConnection.setRemoteDescription(new RTCSessionDescription(answer))
+  const processPendingCandidates = async () => {
+    if (peerConnection.value && peerConnection.value.remoteDescription) {
+      while (pendingCandidates.length > 0) {
+        const cand = pendingCandidates.shift()
+        if (cand) {
+          try {
+            await peerConnection.value.addIceCandidate(new RTCIceCandidate(cand))
+          } catch (e) {
+            console.error('Error adding pending ICE candidate:', e)
+          }
+        }
       }
-    } catch (err) {
-      console.error('Error handling answer:', err)
     }
   }
 
-  // Reject incoming call
   const rejectCall = () => {
-    sendSignal('end-call', { reason: 'rejected' })
-    pendingOffer = null
-    pendingCaller = null
-    incomingRingTone.stop()
+    const activeId = getActiveConversationId()
+    if (activeId) sendSignal('reject', null, activeId)
     cleanupCall()
   }
 
-  // End call
   const endCall = () => {
-    sendSignal('end-call', { reason: 'ended' })
-    pendingOffer = null
-    pendingCaller = null
-    stopAllTones()
+    const activeId = getActiveConversationId()
+    if (activeId) sendSignal('end', null, activeId)
     cleanupCall()
   }
 
-  // Toggle microphone
+  const cleanupCall = () => {
+    stopTimer()
+
+    if (localStream.value) {
+      localStream.value.getTracks().forEach((track) => track.stop())
+      localStream.value = null
+    }
+
+    if (remoteStream.value) {
+      remoteStream.value.getTracks().forEach((track) => track.stop())
+      remoteStream.value = null
+    }
+
+    if (peerConnection.value) {
+      peerConnection.value.ontrack = null
+      peerConnection.value.onicecandidate = null
+      peerConnection.value.onconnectionstatechange = null
+      peerConnection.value.close()
+      peerConnection.value = null
+    }
+
+    isCallActive.value = false
+    isCallIncoming.value = false
+    isCallOutgoing.value = false
+    isMicMuted.value = false
+    isCameraEnabled.value = true
+    isSpeakerMuted.value = false
+    pendingOffer.value = null
+    pendingCandidates.length = 0
+  }
+
   const toggleMic = () => {
-    if (localMediaStream) {
-      const audioTrack = localMediaStream.getAudioTracks()[0]
+    if (localStream.value) {
+      const audioTrack = localStream.value.getAudioTracks()[0]
       if (audioTrack) {
         audioTrack.enabled = !audioTrack.enabled
         isMicMuted.value = !audioTrack.enabled
@@ -311,90 +328,21 @@ export function useWebRTC(conversationId: number) {
     }
   }
 
-  // Toggle speaker
+  const toggleCamera = () => {
+    if (localStream.value) {
+      const videoTrack = localStream.value.getVideoTracks()[0]
+      if (videoTrack) {
+        videoTrack.enabled = !videoTrack.enabled
+        isCameraEnabled.value = videoTrack.enabled
+      }
+    }
+  }
+
   const toggleSpeaker = () => {
     isSpeakerMuted.value = !isSpeakerMuted.value
   }
 
-  // Toggle camera during a video call
-  const toggleCamera = () => {
-    if (!isVideoCall.value) return
-    if (!localMediaStream) return
-
-    const videoTrack = localMediaStream.getVideoTracks()[0]
-    if (videoTrack) {
-      videoTrack.enabled = !videoTrack.enabled
-      isCameraEnabled.value = videoTrack.enabled
-    }
-  }
-
-  // Stop all tones
-  const stopAllTones = () => {
-    incomingRingTone.stop()
-    outgoingRingbackTone.stop()
-  }
-
-  // Cleanup
-  const cleanupCall = () => {
-    stopAllTones()
-
-    if (peerConnection) {
-      peerConnection.close()
-      peerConnection = null
-    }
-    if (localMediaStream) {
-      localMediaStream.getTracks().forEach(track => track.stop())
-      localMediaStream = null
-    }
-    if (callTimerInterval) {
-      clearInterval(callTimerInterval)
-      callTimerInterval = null
-    }
-
-    localStream.value = null
-    remoteStream.value = null
-    isCallActive.value = false
-    isCallIncoming.value = false
-    isCallOutgoing.value = false
-    callDuration.value = 0
-    isMicMuted.value = false
-    isSpeakerMuted.value = false
-    isVideoCall.value = false
-    isCameraEnabled.value = false
-    callerName.value = ''
-    pendingOffer = null
-    pendingCaller = null
-    pendingVideo = false
-  }
-
-  // Start call timer
-  const startCallTimer = () => {
-    callDuration.value = 0
-    callTimerInterval = window.setInterval(() => {
-      callDuration.value++
-    }, 1000)
-  }
-
-  // Send signal via server
-  const sendSignal = (type: string, data: any) => {
-    axios.post(route('chat.call.signal', conversationId), {
-      type,
-      data,
-    }).catch(err => {
-      console.error('Error sending signal:', err)
-    })
-  }
-
-  // Format duration
-  const formatDuration = (seconds: number): string => {
-    const mins = Math.floor(seconds / 60)
-    const secs = seconds % 60
-    return `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`
-  }
-
-  // Cleanup on unmount
   onUnmounted(() => {
-    stopAllTones()
     cleanupCall()
   })
 
@@ -410,15 +358,15 @@ export function useWebRTC(conversationId: number) {
     isSpeakerMuted,
     isVideoCall,
     isCameraEnabled,
+    pendingOffer,
     formatDuration,
-    registerCallListeners,
+    handleSignal,
     startCall,
     acceptCall,
     rejectCall,
     endCall,
     toggleMic,
     toggleSpeaker,
-    toggleCamera,
+    toggleCamera
   }
 }
-
